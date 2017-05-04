@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"bufio"
 	"time"
+	"strings"
 
     "os"
 	"os/exec"
@@ -159,21 +160,40 @@ func unityDo(ahkcmd *exec.Cmd, editorlog string, done chan<- int) {
 func findCommandScript(cmd string) string {
 	ret := cmd
 
-	if _, err := os.Stat(cmd); os.IsNotExist(err) {
+	if _, err := os.Stat(ret); os.IsNotExist(err) {
 		ret, err = exec.LookPath(cmd)
 	}
 
-	cwd, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	if _, err := os.Stat(ret); os.IsNotExist(err) {
+		exe, err := os.Executable()
+		if err != nil {
+			log.Fatal(err)
+		}
+		cwd, err := filepath.Abs(filepath.Dir(exe))
+		if err != nil {
+			log.Fatal(err)
+		}
+
 		ret = path.Join(cwd, cmd)
+
+		if _, err := os.Stat(ret); os.IsNotExist(err) {
+			ret = path.Join(cwd, "unity_" + cmd + ".ahk")
+		}
 	}
 
 	if _, err := os.Stat(ret); os.IsNotExist(err) {
-		ret = path.Join(cwd, "unity_" + cmd + ".ahk")
+		gopaths := strings.Split(os.Getenv("gopath"), ":;")
+		for i := len(gopaths) - 1; i >= 0; i-- {
+			testret := path.Join(gopaths[i], "src", "github.com", "rakete", "unity_do", cmd)
+			if _, err := os.Stat(testret); err == nil {
+				ret = testret
+			}
+
+			testret = path.Join(gopaths[i], "src", "github.com", "rakete", "unity_do", "unity_" + cmd + ".ahk")
+			if _, err := os.Stat(testret); err == nil {
+				ret = testret
+			}
+		}
 	}
 
 	return ret
