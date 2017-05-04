@@ -203,14 +203,28 @@ func main() {
     userprofile := os.Getenv("userprofile")
     editorlog := path.Join(userprofile, "AppData", "Local", "Unity", "Editor", "Editor.log")
 	programfiles := os.Getenv("programfiles")
-	ahkexe := path.Join(programfiles, "AutoHotKey", "AutoHotKey.exe")
+	programfilesx86 := os.Getenv("programfiles(x86")
+
+	ahkexe, _ := exec.LookPath("AutoHotKey.exe")
+	if _, err := os.Stat(ahkexe); os.IsNotExist(err) {
+		ahkexe = path.Join(programfiles, "AutoHotKey", "AutoHotKey.exe")
+	}
+
+	if _, err := os.Stat(ahkexe); os.IsNotExist(err) {
+		ahkexe = path.Join(programfilesx86, "AutoHotKey", "AutoHotKey.exe")
+	}
+
+	if _, err := os.Stat(ahkexe); os.IsNotExist(err) {
+		log.Fatal("AutoHotKey.exe not found, please make sure you have AutoHotKey installed.")
+	}
 
 	if len(os.Args) < 2 {
-		fmt.Printf("Usage: unity_do <command> <optional>")
+		fmt.Printf("Usage: unity_do <command> <optional command to run after first>\n")
+		fmt.Printf("A command may be any AutoHotKey script, or refresh, build or play.\n")
 		os.Exit(0)
 	}
 
-	ahkrunfirst := os.Args[1] //path.Join(userprofile, "Desktop", "unity_do", "unity_refresh.ahk")
+	ahkrunfirst := os.Args[1]
 	ahkrunfirst = findCommandScript(ahkrunfirst)
 	ahkfirstcmd := exec.Command(ahkexe, ahkrunfirst)
 
