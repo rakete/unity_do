@@ -17,12 +17,13 @@ import (
     "github.com/hpcloud/tail"
 )
 
-func unityDo(ahkcmd *exec.Cmd, editorlog string, done chan<- int) {
+func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, done chan<- int) {
 	var reNothingChanged = regexp.MustCompile("^Refresh: detecting if any assets need to be imported or removed ... Refresh: elapses .* seconds \\(Nothing changed\\)")
 
 	var reCompilerOutputStart = regexp.MustCompile("^-----CompilerOutput:-stdout")
 	var reCompilerOutputEnd = regexp.MustCompile("^-----EndCompilerOutput")
 
+	var reFinishedCompileEditor = regexp.MustCompile("^- Finished compile.*Editor\\.dll")
 	var reFinishedCompile = regexp.MustCompile("^- Finished compile")
 	var reFailedCompile = regexp.MustCompile("^Compilation failed: ")
 	var reEnlighten = regexp.MustCompile("^Enlighten scene contents: ")
@@ -35,35 +36,44 @@ func unityDo(ahkcmd *exec.Cmd, editorlog string, done chan<- int) {
 	counterSkipped := 0
 	counterFinished := 0
 
-	stateCompilerFailed := false
-	stateCompilerOutputStarted := false
-	stateNothingChanged := false
+	compilerOutputStarted := false
+	compilerOutputEnded := true
+	compilerFailed := false
+	nothingChanged := false
 
-	var accCompilerMessages []string
-
+	var compilerMessages []string
 
 	updateCompilerState := func(line string) {
+
 		if reCompilerOutputStart.MatchString(line) {
-			if ! stateCompilerOutputStarted {
-				stateCompilerOutputStarted = true
-				accCompilerMessages = nil
-				stateCompilerFailed = false
+			if ! compilerOutputStarted {
+				compilerOutputStarted = true
+				compilerOutputEnded = false
+				compilerMessages = nil
+				compilerFailed = false
 			}
 		}
 
-		if stateCompilerOutputStarted {
+		if ! compilerOutputEnded {
 			var re = regexp.MustCompile("^-----")
 			if ! re.MatchString(line) {
-				accCompilerMessages = append(accCompilerMessages, line)
+				compilerMessages = append(compilerMessages, line)
 			}
+		}
+
+		if reFinishedCompileEditor.MatchString(line) {
+			if ! compilerOutputStarted {
+				compilerMessages = nil
+			}
+			compilerOutputStarted = false
 		}
 
 		if reCompilerOutputEnd.MatchString(line) {
-			stateCompilerOutputStarted = false
+			compilerOutputEnded = true
 		}
 
 		if reFailedCompile.MatchString(line) {
-			stateCompilerFailed = true
+			compilerFailed = true
 		}
 	}
 
@@ -83,16 +93,22 @@ func unityDo(ahkcmd *exec.Cmd, editorlog string, done chan<- int) {
 		log.Fatal(err)
 	}
 
+	oldMessages := compilerMessages
+	compilerMessages = nil
+
 	endlocation := &tail.SeekInfo{Offset: 0, Whence: 2}
 	if t, err := tail.TailFile(editorlog, tail.Config{Follow: true, Poll: true, Location: endlocation, Logger: tail.DiscardingLogger}); err == nil {
-		err := ahkcmd.Start()
-		if err != nil {
-			log.Fatal(err)
-		}
-
 		tailing := false
 		go func() {
-			time.Sleep(2 * time.Second)
+			for _, ahkcmd := range ahkcmdlist {
+				if ! tailing {
+					err = ahkcmd.Run()
+					if err != nil { log.Fatal(err) }
+				}
+
+				time.Sleep(waitms * time.Millisecond)
+			}
+
 			if ! tailing {
 				log.Print("Timeout! Is Unity minimized?")
 				done <- 1
@@ -103,6 +119,18 @@ func unityDo(ahkcmd *exec.Cmd, editorlog string, done chan<- int) {
 			tailing = true
 
 			updateCompilerState(line.Text)
+
+			if reFinishedCompile.MatchString(line.Text) {
+				if compilerFailed {
+					counterFinished = 3
+				} else {
+					counterFinished++
+				}
+			}
+
+			if reEnlighten.MatchString(line.Text) {
+				counterFinished = 2
+			}
 
 			if reComputeAssetHashes.MatchString(line.Text) {
 				s := reComputeAssetHashes.FindStringSubmatch(line.Text)[1]
@@ -115,35 +143,29 @@ func unityDo(ahkcmd *exec.Cmd, editorlog string, done chan<- int) {
 
 			if reTotalAssetImport.MatchString(line.Text) {
 				if counterHashed > 0 && counterHashed == counterSkipped {
-					stateNothingChanged = true
+					nothingChanged = true
 				} else {
 					counterSkipped = 0
 					counterHashed = 0
 				}
 			}
 
-			if reFinishedCompile.MatchString(line.Text) {
-				if stateCompilerFailed {
-					counterFinished = 3
-				} else {
-					counterFinished++
+			if reNothingChanged.MatchString(line.Text) {
+				nothingChanged = true
+			}
+
+			if nothingChanged {
+				for _, msg := range oldMessages {
+					fmt.Printf("%s\n", msg)
 				}
 			}
 
-			if reEnlighten.MatchString(line.Text) {
-				counterFinished = 2
-			}
-
-			if reNothingChanged.MatchString(line.Text) {
-				stateNothingChanged = true
-			}
-
-			if stateNothingChanged || counterFinished >= 2 {
-				for _, msg := range accCompilerMessages {
+			if nothingChanged || counterFinished >= 2 {
+				for _, msg := range compilerMessages {
 					fmt.Printf("%s\n", msg)
 				}
 
-				if stateCompilerFailed {
+				if compilerFailed {
 					done <- 1
 				} else {
 					done <- 0
@@ -226,7 +248,10 @@ func main() {
 
 	ahkrunfirst := os.Args[1]
 	ahkrunfirst = findCommandScript(ahkrunfirst)
-	ahkfirstcmd := exec.Command(ahkexe, ahkrunfirst)
+	var ahkfirstlist []*exec.Cmd
+	ahkfirstlist = append(ahkfirstlist, exec.Command(ahkexe, ahkrunfirst))
+	ahkfirstlist = append(ahkfirstlist, exec.Command(ahkexe, ahkrunfirst))
+	ahkfirstlist = append(ahkfirstlist, exec.Command(ahkexe, ahkrunfirst))
 
 	var ahkaftercmd *exec.Cmd
 	if len(os.Args) > 2 {
@@ -236,7 +261,7 @@ func main() {
 	}
 
 	done := make(chan int)
-	go unityDo(ahkfirstcmd, editorlog, done)
+	go unityDo(ahkfirstlist, 1000, editorlog, done)
 
 	exitcode := 0
 	exitcode = <-done
