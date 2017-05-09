@@ -17,65 +17,151 @@ import (
     "github.com/hpcloud/tail"
 )
 
-func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, done chan<- int) {
-	var reNothingChanged = regexp.MustCompile("^Refresh: detecting if any assets need to be imported or removed ... Refresh: elapses .* seconds \\(Nothing changed\\)")
+type stateNode int
 
-	var reCompilerOutputStart = regexp.MustCompile("^-----CompilerOutput:-stdout")
-	var reCompilerOutputEnd = regexp.MustCompile("^-----EndCompilerOutput")
+const (
+	null stateNode = iota
+	compileGame
+	outputGame
+	failingGame
+	finishedGame
+	compileEditor
+	outputEditor
+	failingEditor
+	success
+	failed
+	hashskip
+	refresh
+)
 
-	var reFinishedCompileEditor = regexp.MustCompile("^- Finished compile.*Editor\\.dll")
-	var reFinishedCompile = regexp.MustCompile("^- Finished compile")
-	var reFailedCompile = regexp.MustCompile("^Compilation failed: ")
-	var reEnlighten = regexp.MustCompile("^Enlighten scene contents: ")
+type compilerState struct {
+	counterHashed int
+	counterSkipped int
 
-	var reComputeAssetHashes = regexp.MustCompile("^----- Compute hash\\(es\\) for ([0-9]+) asset\\(s\\).")
-	var reAssetSkipped = regexp.MustCompile("^----- Asset named (.*) is skipped as no actual change.")
-	var reTotalAssetImport = regexp.MustCompile("^----- Total AssetImport time: ")
+	node stateNode
+	messages []string
 
-	counterHashed := 0
-	counterSkipped := 0
-	counterFinished := 0
+	reRefresh *regexp.Regexp
 
-	compilerOutputStarted := false
-	compilerOutputEnded := true
-	compilerFailed := false
-	nothingChanged := false
+	reComputeAssetHashes *regexp.Regexp
+	reAssetSkipped *regexp.Regexp
+	reTotalAssetImport *regexp.Regexp
 
-	var compilerMessages []string
+	reStartingCompile *regexp.Regexp
+	reCompilerOutputStart *regexp.Regexp
+	reFailedCompile *regexp.Regexp
+	reCompilerOutputEnd *regexp.Regexp
+	reFinishedCompile *regexp.Regexp
+}
 
-	updateCompilerState := func(line string) {
+func initState() compilerState {
+	var ret compilerState
 
-		if reCompilerOutputStart.MatchString(line) {
-			if ! compilerOutputStarted {
-				compilerOutputStarted = true
-				compilerOutputEnded = false
-				compilerMessages = nil
-				compilerFailed = false
-			}
+	ret.counterHashed = 0
+	ret.counterSkipped = 0
+
+	ret.node = null
+	ret.messages = nil
+
+	ret.reRefresh = regexp.MustCompile("^Refresh: detecting if any assets need to be imported or removed ... Refresh: elapses .* seconds \\(Nothing changed\\)")
+
+	ret.reComputeAssetHashes = regexp.MustCompile("^----- Compute hash\\(es\\) for ([0-9]+) asset\\(s\\).")
+	ret.reAssetSkipped = regexp.MustCompile("^----- Asset named (.*) is skipped as no actual change.")
+	ret.reTotalAssetImport = regexp.MustCompile("^----- Total AssetImport time: ")
+
+	ret.reStartingCompile = regexp.MustCompile("^- starting compile")
+	ret.reCompilerOutputStart = regexp.MustCompile("^-----CompilerOutput:-stdout")
+	ret.reFailedCompile = regexp.MustCompile("^Compilation failed: ")
+	ret.reCompilerOutputEnd = regexp.MustCompile("^-----EndCompilerOutput")
+	ret.reFinishedCompile = regexp.MustCompile("^- Finished compile")
+
+	return ret
+}
+
+func updateState(line string, state compilerState) compilerState {
+
+	if state.reRefresh.MatchString(line) && state.node == null {
+		state.node = refresh
+	} else if state.reComputeAssetHashes.MatchString(line) && (state.node == null || state.node == refresh)  {
+		state.node = hashskip
+		state.counterHashed = 0
+		state.counterSkipped = 0
+
+		s := state.reComputeAssetHashes.FindStringSubmatch(line)[1]
+		state.counterHashed, _ = strconv.Atoi(s)
+	} else if state.reAssetSkipped.MatchString(line) && state.node == hashskip {
+		state.counterSkipped++
+	} else if state.reTotalAssetImport.MatchString(line) && state.node == hashskip {
+		if state.counterHashed > 0 && state.counterHashed == state.counterSkipped {
+			state.node = refresh
 		}
+	} else if state.reStartingCompile.MatchString(line) && (state.node == null || state.node == refresh || state.node == hashskip || state.node == failed || state.node == success) {
+		state.node = compileGame
 
-		if ! compilerOutputEnded {
-			var re = regexp.MustCompile("^-----")
-			if ! re.MatchString(line) {
-				compilerMessages = append(compilerMessages, line)
-			}
+		state.messages = nil
+	} else if state.reCompilerOutputStart.MatchString(line) && state.node == compileGame {
+		state.node = outputGame
+	} else if state.reFailedCompile.MatchString(line) && state.node == outputGame {
+		state.node = failingGame
+	} else if state.reCompilerOutputEnd.MatchString(line) && (state.node == outputGame || state.node == failingGame) {
+		if state.node == outputGame {
+			state.node = finishedGame
+		} else if state.node == failingGame {
+			state.node = failed
 		}
-
-		if reFinishedCompileEditor.MatchString(line) {
-			if ! compilerOutputStarted {
-				compilerMessages = nil
-			}
-			compilerOutputStarted = false
+	} else if state.reFinishedCompile.MatchString(line) && state.node == compileGame {
+		state.node = finishedGame
+	} else if state.reStartingCompile.MatchString(line) && state.node == finishedGame {
+		state.node = compileEditor
+	} else if state.reCompilerOutputStart.MatchString(line) && state.node == compileEditor {
+		state.node = outputEditor
+	} else if state.reFailedCompile.MatchString(line) && state.node == outputEditor {
+		state.node = failingEditor
+	} else if state.reCompilerOutputEnd.MatchString(line) && (state.node == outputEditor || state.node == failingEditor) {
+		if state.node == outputEditor {
+			state.node = success
+		} else if state.node == failingEditor {
+			state.node = failed
 		}
+	} else if state.reFinishedCompile.MatchString(line) && state.node == compileEditor {
+		state.node = success
+	}
 
-		if reCompilerOutputEnd.MatchString(line) {
-			compilerOutputEnded = true
-		}
-
-		if reFailedCompile.MatchString(line) {
-			compilerFailed = true
+	if state.node == outputGame || state.node == outputEditor || state.node == failingGame || state.node == failingEditor {
+		var re = regexp.MustCompile("^-----")
+		if ! re.MatchString(line) {
+			state.messages = append(state.messages, line)
 		}
 	}
+
+	return state
+}
+
+func printState(state compilerState) {
+	for _, line := range state.messages {
+		fmt.Printf("%s\n", line)
+	}
+
+	switch state.node {
+		case null: fmt.Printf("null\n")
+		case compileGame: fmt.Printf("compileGame\n")
+		case outputGame: fmt.Printf("outputGame\n")
+		case failingGame: fmt.Printf("failingGame\n")
+		case finishedGame: fmt.Printf("finishedGame\n")
+		case compileEditor: fmt.Printf("compileEditor\n")
+		case outputEditor: fmt.Printf("outputEditor\n")
+		case failingEditor: fmt.Printf("failingEditor\n")
+		case success: fmt.Printf("success\n")
+		case failed: fmt.Printf("failed\n")
+		case hashskip: fmt.Printf("hashskip\n")
+		case refresh: fmt.Printf("refresh\n")
+	}
+}
+
+func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, done chan<- int) {
+
+	state := initState()
+	oldstate := state
 
 	if file, err := os.Open(editorlog); err == nil {
 		defer func() {
@@ -87,14 +173,11 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, don
 
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-			updateCompilerState(scanner.Text())
+			oldstate = updateState(scanner.Text(), oldstate)
 		}
 	} else {
 		log.Fatal(err)
 	}
-
-	oldMessages := compilerMessages
-	compilerMessages = nil
 
 	endlocation := &tail.SeekInfo{Offset: 0, Whence: 2}
 	if t, err := tail.TailFile(editorlog, tail.Config{Follow: true, Poll: true, Location: endlocation, Logger: tail.DiscardingLogger}); err == nil {
@@ -118,60 +201,30 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, don
 		for line := range t.Lines {
 			tailing = true
 
-			updateCompilerState(line.Text)
+			state = updateState(line.Text, state)
 
-			if reFinishedCompile.MatchString(line.Text) {
-				if compilerFailed {
-					counterFinished = 3
-				} else {
-					counterFinished++
-				}
-			}
+			if state.node == success || state.node == failed {
+				printState(state)
 
-			if reEnlighten.MatchString(line.Text) {
-				counterFinished = 2
-			}
-
-			if reComputeAssetHashes.MatchString(line.Text) {
-				s := reComputeAssetHashes.FindStringSubmatch(line.Text)[1]
-				counterHashed, _ = strconv.Atoi(s)
-			}
-
-			if reAssetSkipped.MatchString(line.Text) {
-				counterSkipped++
-			}
-
-			if reTotalAssetImport.MatchString(line.Text) {
-				if counterHashed > 0 && counterHashed == counterSkipped {
-					nothingChanged = true
-				} else {
-					counterSkipped = 0
-					counterHashed = 0
-				}
-			}
-
-			if reNothingChanged.MatchString(line.Text) {
-				nothingChanged = true
-			}
-
-			if nothingChanged {
-				for _, msg := range oldMessages {
-					fmt.Printf("%s\n", msg)
-				}
-			}
-
-			if nothingChanged || counterFinished >= 2 {
-				for _, msg := range compilerMessages {
-					fmt.Printf("%s\n", msg)
-				}
-
-				if compilerFailed {
+				if state.node == failed {
 					done <- 1
 				} else {
 					done <- 0
 				}
 
 				return
+			}
+
+			if state.node == refresh {
+				if oldstate.node == success || oldstate.node == failed {
+					printState(oldstate)
+				}
+
+				if oldstate.node == failed {
+					done <- 1
+				} else {
+					done <- 0
+				}
 			}
 		}
 	}
@@ -261,7 +314,7 @@ func main() {
 	}
 
 	done := make(chan int)
-	go unityDo(ahkfirstlist, 1000, editorlog, done)
+	go unityDo(ahkfirstlist, 500, editorlog, done)
 
 	exitcode := 0
 	exitcode = <-done
