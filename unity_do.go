@@ -137,12 +137,13 @@ func updateState(line string, state compilerState) compilerState {
 	return state
 }
 
-func printState(state compilerState) {
+func printState(state compilerState, debug bool) {
 	for _, line := range state.messages {
 		fmt.Printf("%s\n", line)
 	}
 
-	switch state.node {
+	if debug {
+		switch state.node {
 		case null: fmt.Printf("null\n")
 		case compileGame: fmt.Printf("compileGame\n")
 		case outputGame: fmt.Printf("outputGame\n")
@@ -155,6 +156,7 @@ func printState(state compilerState) {
 		case failed: fmt.Printf("failed\n")
 		case hashskip: fmt.Printf("hashskip\n")
 		case refresh: fmt.Printf("refresh\n")
+		}
 	}
 }
 
@@ -204,7 +206,7 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, don
 			state = updateState(line.Text, state)
 
 			if state.node == success || state.node == failed {
-				printState(state)
+				printState(state, false)
 
 				if state.node == failed {
 					done <- 1
@@ -217,7 +219,7 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, don
 
 			if state.node == refresh {
 				if oldstate.node == success || oldstate.node == failed {
-					printState(oldstate)
+					printState(oldstate, false)
 				}
 
 				if oldstate.node == failed {
