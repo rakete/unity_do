@@ -117,10 +117,10 @@ func updateState(line string, action string, state compilerState) compilerState 
 		} else if state.reFilename.MatchString(line) && (state.node == startPlay || state.node == logStop) {
 			state.node = logFilename
 
-			matches := state.reFilename.FindStringSubmatch(line)
-			if len(matches) > 2 {
-				filepath := matches[1]
-				linenumber := matches[2]
+			substrings := state.reFilename.FindStringSubmatch(line)
+			if len(substrings) > 2 {
+				filepath := substrings[1]
+				linenumber := substrings[2]
 				for i, log := range state.debuglog {
 					state.debuglog[i] = filepath + ":" + linenumber + ": " + log
 				}
@@ -230,13 +230,42 @@ func printState(state compilerState, debug bool) {
 	}
 
 	for _, log := range state.debuglog {
-		fmt.Printf("%s\n", log)
+		fmt.Printf("%s\n", filterColor(log))
 	}
 
 	if debug {
 		printNode("state: %s, ", state.node)
 		printNode("laststate: %s\n", state.lastnode)
 	}
+}
+
+func filterColor(line string) string {
+	reColor := regexp.MustCompile("<color=([a-zA-Z0-9#]+)>([^<]*)</color>")
+	replaceWithAnsiColor := func(match string) string {
+		ret := match
+		substrings := reColor.FindStringSubmatch(match)
+
+		if len(substrings) > 2 {
+			color := substrings[1]
+			text := substrings[2]
+
+			switch color {
+			    case "black": ret = "[30m" + text + "[0m"
+			    case "red": ret = "[31m" + text + "[0m"
+			    case "green": ret = "[32m" + text + "[0m"
+			    case "yellow": ret = "[33m" + text + "[0m"
+			    case "blue": ret = "[34m" + text + "[0m"
+			    case "magenta": ret = "[35m" + text + "[0m"
+			    case "cyan": ret = "[36m" + text + "[0m"
+			    case "white": ret = "[37m" + text + "[0m"
+				default: ret = "[37m" + text + "[0m"
+			}
+		}
+
+		return ret
+	}
+
+	return reColor.ReplaceAllStringFunc(line, replaceWithAnsiColor)
 }
 
 func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, action string, editorlog string, done chan<- int) {
@@ -404,7 +433,6 @@ func main() {
 		fmt.Printf("A command may be any AutoHotKey script, or refresh, build or play.\n")
 		os.Exit(0)
 	}
-
 
 	ahkrunfirst := os.Args[1]
 	ahkrunfirst = findCommandScript(ahkrunfirst)
