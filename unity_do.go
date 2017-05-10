@@ -32,6 +32,11 @@ const (
 	failed
 	hashskip
 	refresh
+	startPlay
+	logPlay
+	logStop
+	logFilename
+	stopPlay
 )
 
 type compilerState struct {
@@ -40,8 +45,13 @@ type compilerState struct {
 
 	node stateNode
 	messages []string
+	debuglog []string
+
+	lastline string
+	lastnode stateNode
 
 	reRefresh *regexp.Regexp
+	reEmpty *regexp.Regexp
 
 	reComputeAssetHashes *regexp.Regexp
 	reAssetSkipped *regexp.Regexp
@@ -52,6 +62,11 @@ type compilerState struct {
 	reFailedCompile *regexp.Regexp
 	reCompilerOutputEnd *regexp.Regexp
 	reFinishedCompile *regexp.Regexp
+
+	reLoadScene *regexp.Regexp
+	reUnityEngine *regexp.Regexp
+	reFilename *regexp.Regexp
+	reUnloading *regexp.Regexp
 }
 
 func initState() compilerState {
@@ -62,8 +77,13 @@ func initState() compilerState {
 
 	ret.node = null
 	ret.messages = nil
+	ret.debuglog = nil
+
+	ret.lastline = ""
+	ret.lastnode = null
 
 	ret.reRefresh = regexp.MustCompile("^Refresh: detecting if any assets need to be imported or removed ... Refresh: elapses .* seconds \\(Nothing changed\\)")
+	ret.reEmpty = regexp.MustCompile("^\\s*$")
 
 	ret.reComputeAssetHashes = regexp.MustCompile("^----- Compute hash\\(es\\) for ([0-9]+) asset\\(s\\).")
 	ret.reAssetSkipped = regexp.MustCompile("^----- Asset named (.*) is skipped as no actual change.")
@@ -75,56 +95,96 @@ func initState() compilerState {
 	ret.reCompilerOutputEnd = regexp.MustCompile("^-----EndCompilerOutput")
 	ret.reFinishedCompile = regexp.MustCompile("^- Finished compile")
 
+	ret.reLoadScene = regexp.MustCompile("^Load scene '(.*)' time: ([0-9.]+)")
+	ret.reUnityEngine = regexp.MustCompile("^UnityEngine\\.")
+	ret.reFilename = regexp.MustCompile("^\\(Filename: (.*) Line: ([0-9]+)\\)")
+	ret.reUnloading = regexp.MustCompile("^Unloading ([0-9]+) Unused")
+
 	return ret
 }
 
-func updateState(line string, state compilerState) compilerState {
+func updateState(line string, action string, state compilerState) compilerState {
 
-	if state.reRefresh.MatchString(line) && state.node == null {
-		state.node = refresh
-	} else if state.reComputeAssetHashes.MatchString(line) && (state.node == null || state.node == refresh)  {
-		state.node = hashskip
-		state.counterHashed = 0
-		state.counterSkipped = 0
+	changenode := state.node
 
-		s := state.reComputeAssetHashes.FindStringSubmatch(line)[1]
-		state.counterHashed, _ = strconv.Atoi(s)
-	} else if state.reAssetSkipped.MatchString(line) && state.node == hashskip {
-		state.counterSkipped++
-	} else if state.reTotalAssetImport.MatchString(line) && state.node == hashskip {
-		if state.counterHashed > 0 && state.counterHashed == state.counterSkipped {
+	if action == "play" {
+		if state.reLoadScene.MatchString(line) && (state.node == null || state.node == refresh || state.node == failed || state.node == success) {
+			state.node = startPlay
+		} else if state.reLoadScene.MatchString(state.lastline) && (state.node == startPlay) {
+			state.node = logPlay
+		} else if state.reUnityEngine.MatchString(line) && (state.node == startPlay || state.node == logPlay) {
+			state.node = logStop
+		} else if state.reFilename.MatchString(line) && (state.node == startPlay || state.node == logStop) {
+			state.node = logFilename
+
+			matches := state.reFilename.FindStringSubmatch(line)
+			if len(matches) > 2 {
+				filepath := matches[1]
+				linenumber := matches[2]
+				for i, log := range state.debuglog {
+					state.debuglog[i] = filepath + ":" + linenumber + ": " + log
+				}
+			}
+		} else if state.reFilename.MatchString(state.lastline) && (state.node == logFilename) {
+			state.node = logPlay
+
+			state.debuglog = nil
+		} else if state.reUnloading.MatchString(line) && (state.node == startPlay || state.node == logPlay || state.node == logStop || state.node == logFilename) {
+			state.node = stopPlay
+		}
+
+		if state.node == logPlay {
+			if ! state.reLoadScene.MatchString(line) && ! state.reRefresh.MatchString(line) && ! state.reEmpty.MatchString(line){
+				state.debuglog = append(state.debuglog, line)
+			}
+		}
+	} else {
+		if state.reRefresh.MatchString(line) && state.node == null {
 			state.node = refresh
-		}
-	} else if state.reStartingCompile.MatchString(line) && (state.node == null || state.node == refresh || state.node == hashskip || state.node == failed || state.node == success) {
-		state.node = compileGame
+		} else if state.reComputeAssetHashes.MatchString(line) && (state.node == null || state.node == refresh)  {
+			state.node = hashskip
+			state.counterHashed = 0
+			state.counterSkipped = 0
 
-		state.messages = nil
-	} else if state.reCompilerOutputStart.MatchString(line) && state.node == compileGame {
-		state.node = outputGame
-	} else if state.reFailedCompile.MatchString(line) && state.node == outputGame {
-		state.node = failingGame
-	} else if state.reCompilerOutputEnd.MatchString(line) && (state.node == outputGame || state.node == failingGame) {
-		if state.node == outputGame {
+			s := state.reComputeAssetHashes.FindStringSubmatch(line)[1]
+			state.counterHashed, _ = strconv.Atoi(s)
+		} else if state.reAssetSkipped.MatchString(line) && state.node == hashskip {
+			state.counterSkipped++
+		} else if state.reTotalAssetImport.MatchString(line) && state.node == hashskip {
+			if state.counterHashed > 0 && state.counterHashed == state.counterSkipped {
+				state.node = refresh
+			}
+		} else if state.reStartingCompile.MatchString(line) && (state.node == null || state.node == refresh || state.node == hashskip || state.node == failed || state.node == success) {
+			state.node = compileGame
+
+			state.messages = nil
+		} else if state.reCompilerOutputStart.MatchString(line) && state.node == compileGame {
+			state.node = outputGame
+		} else if state.reFailedCompile.MatchString(line) && state.node == outputGame {
+			state.node = failingGame
+		} else if state.reCompilerOutputEnd.MatchString(line) && (state.node == outputGame || state.node == failingGame) {
+			if state.node == outputGame {
+				state.node = finishedGame
+			} else if state.node == failingGame {
+				state.node = failed
+			}
+		} else if state.reFinishedCompile.MatchString(line) && state.node == compileGame {
 			state.node = finishedGame
-		} else if state.node == failingGame {
-			state.node = failed
-		}
-	} else if state.reFinishedCompile.MatchString(line) && state.node == compileGame {
-		state.node = finishedGame
-	} else if state.reStartingCompile.MatchString(line) && state.node == finishedGame {
-		state.node = compileEditor
-	} else if state.reCompilerOutputStart.MatchString(line) && state.node == compileEditor {
-		state.node = outputEditor
-	} else if state.reFailedCompile.MatchString(line) && state.node == outputEditor {
-		state.node = failingEditor
-	} else if state.reCompilerOutputEnd.MatchString(line) && (state.node == outputEditor || state.node == failingEditor) {
-		if state.node == outputEditor {
+		} else if state.reStartingCompile.MatchString(line) && state.node == finishedGame {
+			state.node = compileEditor
+		} else if state.reCompilerOutputStart.MatchString(line) && state.node == compileEditor {
+			state.node = outputEditor
+		} else if state.reFailedCompile.MatchString(line) && state.node == outputEditor {
+			state.node = failingEditor
+		} else if state.reCompilerOutputEnd.MatchString(line) && (state.node == outputEditor || state.node == failingEditor) {
+			if state.node == outputEditor {
+				state.node = success
+			} else if state.node == failingEditor {
+				state.node = failed
+			}
+		} else if state.reFinishedCompile.MatchString(line) && state.node == compileEditor {
 			state.node = success
-		} else if state.node == failingEditor {
-			state.node = failed
 		}
-	} else if state.reFinishedCompile.MatchString(line) && state.node == compileEditor {
-		state.node = success
 	}
 
 	if state.node == outputGame || state.node == outputEditor || state.node == failingGame || state.node == failingEditor {
@@ -134,7 +194,34 @@ func updateState(line string, state compilerState) compilerState {
 		}
 	}
 
+	state.lastline = line
+	if state.node != changenode {
+		state.lastnode = changenode
+	}
+
 	return state
+}
+
+func printNode(format string, node stateNode) {
+	switch node {
+		case null: fmt.Printf(format, "null")
+		case compileGame: fmt.Printf(format, "compileGame")
+		case outputGame: fmt.Printf(format, "outputGame")
+		case failingGame: fmt.Printf(format, "failingGame")
+		case finishedGame: fmt.Printf(format, "finishedGame")
+		case compileEditor: fmt.Printf(format, "compileEditor")
+		case outputEditor: fmt.Printf(format, "outputEditor")
+		case failingEditor: fmt.Printf(format, "failingEditor")
+		case success: fmt.Printf(format, "success")
+		case failed: fmt.Printf(format, "failed")
+		case hashskip: fmt.Printf(format, "hashskip")
+		case refresh: fmt.Printf(format, "refresh")
+		case startPlay: fmt.Printf(format, "startPlay")
+		case logPlay: fmt.Printf(format, "logPlay")
+		case logStop: fmt.Printf(format, "logStop")
+		case logFilename: fmt.Printf(format, "logFilename")
+		case stopPlay: fmt.Printf(format, "stopPlay")
+	}
 }
 
 func printState(state compilerState, debug bool) {
@@ -142,25 +229,17 @@ func printState(state compilerState, debug bool) {
 		fmt.Printf("%s\n", line)
 	}
 
+	for _, log := range state.debuglog {
+		fmt.Printf("%s\n", log)
+	}
+
 	if debug {
-		switch state.node {
-		case null: fmt.Printf("null\n")
-		case compileGame: fmt.Printf("compileGame\n")
-		case outputGame: fmt.Printf("outputGame\n")
-		case failingGame: fmt.Printf("failingGame\n")
-		case finishedGame: fmt.Printf("finishedGame\n")
-		case compileEditor: fmt.Printf("compileEditor\n")
-		case outputEditor: fmt.Printf("outputEditor\n")
-		case failingEditor: fmt.Printf("failingEditor\n")
-		case success: fmt.Printf("success\n")
-		case failed: fmt.Printf("failed\n")
-		case hashskip: fmt.Printf("hashskip\n")
-		case refresh: fmt.Printf("refresh\n")
-		}
+		printNode("state: %s, ", state.node)
+		printNode("laststate: %s\n", state.lastnode)
 	}
 }
 
-func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, done chan<- int) {
+func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, action string, editorlog string, done chan<- int) {
 
 	state := initState()
 	oldstate := state
@@ -175,7 +254,7 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, don
 
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-			oldstate = updateState(scanner.Text(), oldstate)
+			oldstate = updateState(scanner.Text(), action, oldstate)
 		}
 	} else {
 		log.Fatal(err)
@@ -203,10 +282,11 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, don
 		for line := range t.Lines {
 			tailing = true
 
-			state = updateState(line.Text, state)
+			state = updateState(line.Text, action, state)
+			//printState(state, true)
 
 			if state.node == success || state.node == failed {
-				printState(state, false)
+				printState(state, true)
 
 				if state.node == failed {
 					done <- 1
@@ -217,21 +297,45 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, editorlog string, don
 				return
 			}
 
-			if state.node == refresh {
-				if oldstate.node == success || oldstate.node == failed {
-					printState(oldstate, false)
+			if action == "play" {
+				if state.node == logFilename {
+					printState(state, false)
 				}
 
-				if oldstate.node == failed {
-					done <- 1
-				} else {
+				if state.node == stopPlay {
 					done <- 0
+
+					return
+				}
+			} else {
+				if state.node == refresh {
+					if oldstate.node == success || oldstate.node == failed {
+						printState(oldstate, false)
+					}
+
+					if oldstate.node == failed {
+						done <- 1
+					} else {
+						done <- 0
+					}
+
+					return
 				}
 			}
 		}
 	}
 
 	done <- 1
+}
+
+func findCommandAction(cmd string) string {
+	action := ""
+	var re = regexp.MustCompile(".*unity_(.*)\\.ahk$")
+	var matches = re.FindStringSubmatch(cmd)
+	if len(matches) > 1 {
+		action = re.FindStringSubmatch(cmd)[1]
+	}
+	return action
 }
 
 func findCommandScript(cmd string) string {
@@ -301,8 +405,12 @@ func main() {
 		os.Exit(0)
 	}
 
+
 	ahkrunfirst := os.Args[1]
 	ahkrunfirst = findCommandScript(ahkrunfirst)
+	action := findCommandAction(ahkrunfirst)
+	//fmt.Println(action)
+
 	var ahkfirstlist []*exec.Cmd
 	ahkfirstlist = append(ahkfirstlist, exec.Command(ahkexe, ahkrunfirst))
 	ahkfirstlist = append(ahkfirstlist, exec.Command(ahkexe, ahkrunfirst))
@@ -316,7 +424,7 @@ func main() {
 	}
 
 	done := make(chan int)
-	go unityDo(ahkfirstlist, 500, editorlog, done)
+	go unityDo(ahkfirstlist, 500, action, editorlog, done)
 
 	exitcode := 0
 	exitcode = <-done
