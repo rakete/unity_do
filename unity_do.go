@@ -315,7 +315,7 @@ func unityDo(ahkcmdlist []*exec.Cmd, waitms time.Duration, action string, editor
 			//printState(state, true)
 
 			if state.node == success || state.node == failed {
-				printState(state, true)
+				printState(state, false)
 
 				if state.node == failed {
 					done <- 1
